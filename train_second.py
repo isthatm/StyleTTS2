@@ -1,5 +1,6 @@
 # load packages
 import copy
+import os
 import random
 import yaml
 import time
@@ -62,6 +63,34 @@ logger.setLevel(logging.DEBUG)
 handler = StreamHandler()
 handler.setLevel(logging.DEBUG)
 logger.addHandler(handler)
+
+
+def restore_training_checkpoint(model, optimizer, path, epochs):
+    """Restore a complete Stage 2 epoch without replacing optimizer parameters."""
+    state = torch.load(path, map_location="cpu", weights_only=False)
+    if state.get("stage", "second") != "second":
+        raise ValueError("Resume requires a Stage 2 training checkpoint")
+    epoch, iters = state["epoch"], state["iters"]
+    if type(epoch) is not int or epoch < 0 or type(iters) is not int or iters <= 0:
+        raise ValueError("Checkpoint has no valid completed training epoch")
+    if not np.isfinite(float(state["val_loss"])):
+        raise ValueError("Checkpoint validation loss is not finite")
+    if epoch + 1 >= epochs:
+        raise ValueError("Stage 2 already reached epochs_2nd; export or increase the total target")
+    params = state["net"]
+    saved_optimizers = dict(state["optimizer"])
+    if set(params) != set(model) or set(saved_optimizers) != set(optimizer.optimizers):
+        raise ValueError("Checkpoint model or optimizer components do not match this trainer")
+    for key in model:
+        weights = {name.removeprefix("module."): value for name, value in params[key].items()}
+        model[key].load_state_dict(weights, strict=True)
+    # MultiOptimizer.load_state_dict silently swallows errors; recovery must fail on any mismatch.
+    for key, saved in saved_optimizers.items():
+        optimizer.optimizers[key].load_state_dict(saved)
+    _ = [model[key].train() for key in model]
+    logger.info("Resuming Stage 2 at epoch %s/%s, step %s", epoch + 2, epochs, iters)
+    # shortcut: legacy checkpoints omit RNG state; continuation is not bit-for-bit reproducible.
+    return epoch + 1, iters
 
 
 @click.command()
@@ -154,12 +183,13 @@ def main(config_path):
 
     start_epoch = 0
     iters = 0
+    resume_path = config.get("resume_checkpoint", "")
 
     load_pretrained = config.get("pretrained_model", "") != "" and config.get(
         "second_stage_load_pretrained", False
     )
 
-    if not load_pretrained:
+    if not load_pretrained and not resume_path:
         if config.get("first_stage_path", "") != "":
             first_stage_path = osp.join(
                 log_dir, config.get("first_stage_path", "first_stage.pth")
@@ -239,8 +269,10 @@ def main(config_path):
             g["min_lr"] = 0
             g["weight_decay"] = 1e-4
 
-    # load models if there is a model
-    if load_pretrained:
+    # Restore before DataParallel wrapping, without reinitializing predictor_encoder.
+    if resume_path:
+        start_epoch, iters = restore_training_checkpoint(model, optimizer, resume_path, epochs)
+    elif load_pretrained:
         model, optimizer, start_epoch, iters = load_checkpoint(
             model,
             optimizer,
@@ -266,7 +298,6 @@ def main(config_path):
     best_loss = float("inf")  # best test loss
     loss_train_record = list([])
     loss_test_record = list([])
-    iters = 0
 
     criterion = nn.L1Loss()  # F0 loss (regression)
     torch.cuda.empty_cache()
@@ -911,9 +942,11 @@ def main(config_path):
                 "iters": iters,
                 "val_loss": loss_test / iters_test,
                 "epoch": epoch,
+                "stage": "second",
             }
             save_path = osp.join(log_dir, "epoch_2nd_%05d.pth" % epoch)
-            torch.save(state, save_path)
+            torch.save(state, save_path + ".tmp")
+            os.replace(save_path + ".tmp", save_path)
 
             # if estimate sigma, save the estimated sigma
             if model_params.diffusion.dist.estimate_sigma_data:
